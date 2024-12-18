@@ -1,0 +1,461 @@
+# 242A Final Project - BART System Recovery Study
+Team members: Haitong Wang, Maggie Gao, Shiyi Yang, Ke Zhang, Haolun Le
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(tidyr)
+library(plm)
+library(randomForest)
+library(caret)
+library(MASS)
+library(lmtest)
+library(stargazer)
+```
+
+## Data Processing
+
+```{r}
+# Data loading
+air_traffic <- read.csv("Air Traffic.csv")
+covid_death <- read.csv("CovidDeath.csv")
+spending_and_revenue <- read.csv("Spending_and_Revenue_20241209.csv") # We delete the raw data file of this dataset after we combined all data, because it's too big and can't be uploaded to github
+survey <- read.csv("Survey.csv")
+unemployment <- read.csv("Unemployment.csv")
+rider <- read_excel("Rider.xlsx", sheet = 1) 
+```
+
+```{r}
+# Data cleaning
+# Ridership
+rider <- rider %>%
+  filter(Date >= as.POSIXct("2017-01-01") & Date <= as.POSIXct("2023-12-31"))
+
+# Air traffic
+air_traffic <- air_traffic %>%
+  mutate(Activity.Date = as.Date(Activity.Period.Start.Date, format = "%Y/%m/%d"))
+air_traffic_filtered <- air_traffic %>%
+  filter(Activity.Date >= as.Date("2017-01-01") & Activity.Date <= as.Date("2023-12-31"),
+         Landing.Aircraft.Type == "Passenger")
+daily_totals <- air_traffic_filtered %>%
+  group_by(Activity.Date, GEO.Summary) %>%
+  summarise(Daily_Total_Landings = sum(Landing.Count, na.rm = TRUE), .groups = "drop")
+daily_totals_transformed <- daily_totals %>%
+  tidyr::pivot_wider(names_from = GEO.Summary,
+                     values_from = Daily_Total_Landings) %>%
+  arrange(Activity.Date)
+colnames(daily_totals_transformed) <- c("Date", "International", "Domestic")
+air_traffic <- daily_totals_transformed
+
+air_traffic <- air_traffic %>%
+  mutate(Date = as.Date(Date, format = "%Y/%m/%d"))  # Convert to proper Date format
+```
+
+```{r}
+# Data Combining
+rider <- rider %>%
+  mutate(Date = as.Date(Date))
+
+air_traffic <- air_traffic %>%
+  mutate(Year = format(Date, "%Y"),  # Extract year
+         Month = format(Date, "%m"))  # Extract month
+
+rider <- rider %>%
+  mutate(Year = format(Date, "%Y"),  # Extract year
+         Month = format(Date, "%m"),
+         Day = format(Date,"%d"))  # Extract month
+
+combined_data <- rider %>%
+  left_join(air_traffic, by = c("Year", "Month"))
+data = combined_data
+
+head(combined_data)
+```
+
+```{r}
+str(covid_death$date_of_death)
+
+covid_death <- covid_death %>%
+  mutate(
+    date_of_death = as.Date(sub(" .*", "", date_of_death), format = "%m/%d/%Y"),
+    year = format(date_of_death, "%Y"),
+    month = format(date_of_death, "%m"),
+    day = format(date_of_death, "%d")
+  ) %>%
+  dplyr::select(year, month, day, new_deaths, cumulative_deaths)
+
+final_combined <- combined_data %>%
+  left_join(
+    covid_death,
+    by = c("Year" = "year", "Month" = "month", "Day" = "day")
+  )
+```
+
+```{r}
+# Unemployment
+unemployment$Date <- as.Date(paste(unemployment$Year, unemployment$Month, "01", sep = "-"), format = "%Y-%B-%d")
+
+start_date <- as.Date("2017-01-01")
+end_date <- as.Date("2023-12-31")
+
+selected_counties <- c("San Francisco County", "San Mateo County", "Alameda County", "Contra Costa County")
+
+filtered_unemployment <- unemployment[
+  unemployment$Area.Name %in% selected_counties &
+    unemployment$Date >= start_date &
+    unemployment$Date <= end_date,
+]
+
+aggregated_unemployment <- filtered_unemployment %>%
+  group_by(Year, Month) %>%
+  summarise(
+    Total_Labor_Force = sum(Labor.Force, na.rm = TRUE),
+    Total_Employment = sum(Employment, na.rm = TRUE),
+    Total_Unemployment = sum(Unemployment, na.rm = TRUE),
+    Average_Unemployment_Rate = mean(Unemployment.Rate, na.rm = TRUE)
+  )
+
+month_mapping <- data.frame(
+  Month = c("January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"),
+  Month_Numeric = sprintf("%02d", 1:12) # Create two-digit month numbers
+)
+aggregated_unemployment <- aggregated_unemployment %>%
+  left_join(month_mapping, by = "Month") %>%
+  mutate(Month = Month_Numeric) %>%
+  dplyr::select(-Month_Numeric)
+
+unemployment = aggregated_unemployment
+```
+
+
+```{r}
+# Final cleaned data
+final_combined <- final_combined %>%
+  mutate(Year = as.integer(Year))
+
+final_combined_with_unemployment <- final_combined %>%
+  left_join(aggregated_unemployment, by = c("Year", "Month"))
+
+library(writexl)
+write_xlsx(final_combined_with_unemployment, "data.xlsx")
+
+data <- read_excel("data.xlsx")
+
+bart_lines <- list(
+  "Yellow_Line" = c("RM", "EN", "EP", "NB", "BK", "AS", "MA", "19", "12", "LM", "FV", "CL",
+                    "SL", "BF", "HY", "SH", "UC", "FM", "WS", "SO", "MB"),
+  "Blue_Line" = c("ED", "WD", "CV", "CL", "SL", "BF", "HY", "SH", "UC", "FM"),
+  "Orange_Line" = c("BE", "ML", "WS", "FM", "UC", "SH", "HY", "BF", "SL", "CL", "LM", "OW")
+)
+
+bart_lines <- lapply(bart_lines, function(line) {
+  line[line %in% colnames(data)]
+})
+
+for (line_name in names(bart_lines)) {
+  stations <- bart_lines[[line_name]]
+  data[stations] <- lapply(data[stations], as.numeric)
+  data[[line_name]] <- rowSums(data[, stations, drop = FALSE], na.rm = TRUE)
+}
+
+head(data)
+#write_xlsx(data, "combined_data.xlsx")
+```
+
+## Analysis
+
+```{r}
+data = read_xlsx("combined_data.xlsx")
+data[is.na(data)] <- 0
+```
+
+```{r}
+plot_data_weekly <- data %>%
+  dplyr::select(Date, Yellow_Line, Blue_Line, Orange_Line) %>%
+  mutate(Week = floor_date(Date, unit = "week")) %>% 
+  group_by(Week) %>%
+  summarise(
+    Yellow_Line = sum(Yellow_Line, na.rm = TRUE),
+    Blue_Line = sum(Blue_Line, na.rm = TRUE),
+    Orange_Line = sum(Orange_Line, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = c(Yellow_Line, Blue_Line, Orange_Line),
+               names_to = "Line",
+               values_to = "Exits")
+
+ggplot(plot_data_weekly, aes(x = Week, y = Exits, color = Line)) +
+  geom_line(linewidth = 0.8) + # Weekly trend line
+  labs(
+    title = "Weekly BART Exits Over Time by Line",
+    x = "Week",
+    y = "Weekly Exits",
+    color = "BART Line"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+data <- data %>%
+  mutate(Post = ifelse(Date >= as.Date("2020-03-01"), 1, 0))
+
+panel_data <- pdata.frame(data, index = c("Date"))
+panel_data$Weekday <- ifelse(wday(panel_data$Date, week_start = 1) %in% 1:5, 1, 0)  # 1 for Mon-Fri
+panel_data$Weekend <- ifelse(panel_data$Weekday == 0, 1, 0)  # 1 for Sat-Sun
+
+
+panel_data <- panel_data %>%
+  mutate(
+    log_Yellow_Line = log(Yellow_Line),
+    log_Blue_Line = log(Blue_Line),
+    log_Orange_Line = log(Orange_Line),
+    log_Total = log(Total),
+    log_International = log(International),
+    log_Domestic = log(Domestic)
+  )
+```
+
+```{r}
+model_yellow <- plm(
+  formula = log_Yellow_Line ~ Post + log_International + log_Domestic + 
+    Average_Unemployment_Rate + Post:log_International + Post:log_Domestic + Weekday + Post:Weekday,
+  data = panel_data,
+  model = "within",  # Fixed effects
+  effect = "time"    # Time fixed effects
+)
+summary(model_yellow)
+coeftest(model_yellow, vcov = vcovHC(model_yellow, type = "HC1"))
+
+
+model_blue <- plm(
+  formula = log_Blue_Line ~ Post + log_International + log_Domestic + 
+    Average_Unemployment_Rate + Post:log_International + Post:log_Domestic + Weekday + Post:Weekday,
+  data = panel_data,
+  model = "within",  # Fixed effects
+  effect = "time"    # Time fixed effects
+)
+summary(model_blue)
+coeftest(model_blue, vcov = vcovHC(model_blue, type = "HC1"))
+
+
+model_orange <- plm(
+  formula = log_Orange_Line ~ Post + log_International + log_Domestic + 
+    Average_Unemployment_Rate + Post:log_International + Post:log_Domestic + Weekday + Post:Weekday,
+  data = panel_data,
+  model = "within",  # Fixed effects
+  effect = "time"    # Time fixed effects
+)
+summary(model_orange)
+coeftest(model_orange, vcov = vcovHC(model_orange, type = "HC1"))
+
+
+model_total <- plm(
+  formula = log_Total ~ Post + log_International + log_Domestic + 
+    Average_Unemployment_Rate + Post:log_International + Post:log_Domestic + Weekday + Post:Weekday,
+  data = panel_data,
+  model = "within",  # Fixed effects
+  effect = "time"    # Time fixed effects
+)
+summary(model_total)
+coeftest(model_total, vcov = vcovHC(model_total, type = "HC1"))
+```
+
+```{r}
+robust_se_yellow <- vcovHC(model_yellow, type = "HC1")
+robust_se_blue <- vcovHC(model_blue, type = "HC1")
+robust_se_orange <- vcovHC(model_orange, type = "HC1")
+robust_se_total <- vcovHC(model_total, type = "HC1")
+
+robust_se_list <- list(
+  sqrt(diag(robust_se_yellow)),
+  sqrt(diag(robust_se_blue)),
+  sqrt(diag(robust_se_orange)),
+  sqrt(diag(robust_se_total))
+)
+stargazer(
+  model_yellow, model_blue, model_orange, model_total,
+  se = robust_se_list,
+  title = "Fixed Effects Regression Results with Time Effects",
+  type = "html",
+  dep.var.labels = c("Yellow Line", "Blue Line", "Orange Line", "Total Exits"),
+  covariate.labels = c("Post", "International Flights", "Domestic Flights",
+                       "Unemployment Rate"),
+  omit.stat = c("f", "ser"),
+  out = "Fixed Effects Regression.html",
+  align = TRUE
+)
+# The table will display in html file
+```
+
+## Random Forest
+
+```{r}
+rf_data <- panel_data %>%
+  mutate(
+    log_Yellow_Line = log(Yellow_Line),
+    log_Blue_Line = log(Blue_Line),
+    log_Orange_Line = log(Orange_Line),
+    log_International = log(International),
+    log_Domestic = log(Domestic)
+  )
+  
+rf_data <- na.omit(rf_data)
+
+set.seed(123)
+train_index <- createDataPartition(rf_data$log_Yellow_Line, p = 0.8, list = FALSE)
+
+train_data <- rf_data[train_index, ]
+test_data <- rf_data[-train_index, ]
+
+predictors <- c("Post", "log_International", "log_Domestic", "Average_Unemployment_Rate", "cumulative_deaths", "Weekday")
+
+rf_yellow <- randomForest(log_Yellow_Line ~ ., data = train_data[, c("log_Yellow_Line", predictors)], ntree = 500, importance = TRUE)
+rf_blue <- randomForest(log_Blue_Line ~ ., data = train_data[, c("log_Blue_Line", predictors)], ntree = 500, importance = TRUE)
+rf_orange <- randomForest(log_Orange_Line ~ ., data = train_data[, c("log_Orange_Line", predictors)], ntree = 500, importance = TRUE)
+
+pred_yellow <- predict(rf_yellow, test_data)
+pred_blue <- predict(rf_blue, test_data)
+pred_orange <- predict(rf_orange, test_data)
+
+yellow_rmse <- sqrt(mean((test_data$log_Yellow_Line - pred_yellow)^2))
+blue_rmse <- sqrt(mean((test_data$log_Blue_Line - pred_blue)^2))
+orange_rmse <- sqrt(mean((test_data$log_Orange_Line - pred_orange)^2))
+
+cat("RMSE for Yellow Line:", yellow_rmse, "\n")
+cat("RMSE for Blue Line:", blue_rmse, "\n")
+cat("RMSE for Orange Line:", orange_rmse, "\n")
+
+cat("Variable Importance for Yellow Line:\n")
+print(importance(rf_yellow))
+
+cat("Variable Importance for Blue Line:\n")
+print(importance(rf_blue))
+
+cat("Variable Importance for Orange Line:\n")
+print(importance(rf_orange))
+
+par(mfrow = c(1, 3))
+varImpPlot(rf_yellow, main = "Yellow Line - Variable Importance")
+varImpPlot(rf_blue, main = "Blue Line - Variable Importance")
+varImpPlot(rf_orange, main = "Orange Line - Variable Importance")
+```
+```{r}
+poisson_yellow <- glm(
+  log(Yellow_Line) ~ Post + log(International) + log(Domestic) + 
+    Average_Unemployment_Rate + Post*Weekday,
+  data = panel_data,
+  family = poisson(link = "log")
+)
+summary(poisson_yellow)
+
+poisson_blue <- glm(
+  log(Blue_Line) ~ Post + log(International) + log(Domestic) + 
+    Average_Unemployment_Rate + Post*Weekday,
+  data = panel_data,
+  family = poisson(link = "log")
+)
+summary(poisson_blue)
+
+poisson_orange <- glm(
+  log(Orange_Line) ~ Post + log(International) + log(Domestic) + 
+    Average_Unemployment_Rate + Post*Weekday,
+  data = panel_data,
+  family = poisson(link = "log")
+)
+summary(poisson_orange)
+
+nb_yellow <- glm.nb(
+  log(Yellow_Line) ~ Post + log(International) + log(Domestic) + 
+    Average_Unemployment_Rate + Post*Weekday,
+  data = panel_data
+)
+summary(nb_yellow)
+
+nb_blue <- glm.nb(
+  log(Blue_Line) ~ Post + log(International) + log(Domestic) + 
+    Average_Unemployment_Rate + Post*Weekday,
+  data = panel_data
+)
+summary(nb_blue)
+
+nb_orange <- glm.nb(
+  log(Orange_Line) ~ Post + log(International) + log(Domestic) + 
+    Average_Unemployment_Rate + Post*Weekday,
+  data = panel_data
+)
+summary(nb_orange)
+
+```
+
+```{r}
+
+lrtest(poisson_yellow, nb_yellow)
+lrtest(poisson_blue, nb_blue)
+lrtest(poisson_orange, nb_orange)
+
+avg_international <- mean(panel_data$International, na.rm = TRUE)
+avg_domestic <- mean(panel_data$Domestic, na.rm = TRUE)
+avg_unemployment_rate <- mean(panel_data$Average_Unemployment_Rate, na.rm = TRUE)
+
+scenarios <- expand.grid(
+  International = c(avg_international * 1.5, avg_international, avg_international * 0.5),
+  Average_Unemployment_Rate = c(avg_unemployment_rate * 1.5, avg_unemployment_rate, avg_unemployment_rate * 0.5),
+  Domestic = avg_domestic,
+  Post = 1,  # High WFH
+  Weekday = 1 # Weekday
+)
+scenarios$Scenario <- apply(scenarios, 1, function(row) {
+  intl <- ifelse(row["International"] == avg_international * 1.5, "High Intl",
+                 ifelse(row["International"] == avg_international, "Stable Intl", "Low Intl"))
+  unemploy <- ifelse(row["Average_Unemployment_Rate"] == avg_unemployment_rate * 1.5, "High Unemployment",
+                     ifelse(row["Average_Unemployment_Rate"] == avg_unemployment_rate, "Stable Unemployment", "Low Unemployment"))
+  paste(intl, unemploy, sep = ", ")
+})
+
+scenarios$Predicted_Yellow <- predict(
+  nb_yellow,
+  newdata = scenarios,
+  type = "response"
+)
+
+scenarios$Predicted_Blue <- predict(
+  nb_blue,
+  newdata = scenarios,
+  type = "response"
+)
+
+scenarios$Predicted_Orange <- predict(
+  nb_orange,
+  newdata = scenarios,
+  type = "response"
+)
+
+scenarios
+```
+
+```{r}
+data$Weekday <- ifelse(weekdays(as.Date(data$Date)) %in% c("Saturday", "Sunday"), 0, 1)
+
+summary_vars <- data[, c("Yellow_Line", "Blue_Line", "Orange_Line",
+                         "International", "Domestic", "Average_Unemployment_Rate",
+                         "Total", "Post", "Weekday", "cumulative_deaths")]
+
+summary_stats <- data.frame(
+  Variable = names(summary_vars),
+  Mean = sapply(summary_vars, function(x) mean(x, na.rm = TRUE)),
+  SD = sapply(summary_vars, function(x) sd(x, na.rm = TRUE)),
+  Min = sapply(summary_vars, function(x) min(x, na.rm = TRUE)),
+  Median = sapply(summary_vars, function(x) median(x, na.rm = TRUE)),
+  Max = sapply(summary_vars, function(x) max(x, na.rm = TRUE))
+)
+summary_stats
+
+library(openxlsx)
+write.xlsx(summary_stats, "Summary_Statistics.xlsx")
+```
+
+
+
+
